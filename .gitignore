@@ -1,0 +1,12 @@
+.env
+chat_history/
+chroma_db/
+data/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+frontend/node_modules/
+frontend/dist/
+*.log
+.DS_Store
