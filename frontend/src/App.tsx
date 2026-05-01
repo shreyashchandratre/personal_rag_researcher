@@ -50,14 +50,10 @@ export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [health, setHealth] = useState<{
-    chroma_ready: boolean;
-    status?: string;
-  } | null>(null);
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [uploading, setUploading] = useState(false);
-  const [uploadMsg, setUploadMsg] = useState<string | null>(null);
+  const [uploadedPdfs, setUploadedPdfs] = useState<string[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -72,17 +68,9 @@ export default function App() {
     }
   }, []);
 
-  const loadHealth = useCallback(() => {
-    fetch("/api/health")
-      .then((r) => r.json())
-      .then(setHealth)
-      .catch(() => setHealth({ chroma_ready: false }));
-  }, []);
-
   useEffect(() => {
-    loadHealth();
     void loadSessions();
-  }, [loadHealth, loadSessions]);
+  }, [loadSessions]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -97,6 +85,7 @@ export default function App() {
       const sid = data.session_id as string;
       setSessionId(sid);
       setMessages([]);
+      setUploadedPdfs([]);
       sessionStorage.setItem("rag_session_id", sid);
       await loadSessions();
       return sid;
@@ -133,6 +122,7 @@ export default function App() {
   const selectSession = useCallback(
     async (sid: string) => {
       setError(null);
+      setUploadedPdfs([]);
       try {
         const r = await fetch(`/api/sessions/${sid}`);
         if (!r.ok) throw new Error("Session not found");
@@ -166,6 +156,7 @@ export default function App() {
           sessionStorage.removeItem("rag_session_id");
           setSessionId(null);
           setMessages([]);
+          setUploadedPdfs([]);
         }
         await loadSessions();
       } catch (err) {
@@ -223,40 +214,48 @@ export default function App() {
         },
       ]);
       await loadSessions();
-      loadHealth();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Request failed");
       setMessages((m) => m.filter((x) => x.id !== userMsg.id));
     } finally {
       setLoading(false);
     }
-  }, [
-    input,
-    loading,
-    sessionId,
-    loadSessions,
-    loadHealth,
-    startNewSession,
-  ]);
+  }, [input, loading, sessionId, loadSessions, startNewSession]);
 
-  const onPickPdf = useCallback(() => {
-    fileInputRef.current?.click();
-  }, []);
+  // PDF upload — session-scoped
+  const onPickPdf = useCallback(async () => {
+    // Ensure we have a session first
+    let sid = sessionId ?? sessionStorage.getItem("rag_session_id");
+    if (!sid) {
+      sid = await startNewSession();
+    }
+    if (sid) fileInputRef.current?.click();
+  }, [sessionId, startNewSession]);
 
   const onFileChange = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       e.target.value = "";
       if (!file) return;
-      if (!file.name.toLowerCase().endsWith(".pdf")) {
-        setError("Please choose a PDF file.");
+      const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+      const allowed = ["pdf", "docx", "doc", "txt", "md", "png", "jpg", "jpeg", "webp"];
+      if (!allowed.includes(ext)) {
+        setError(`Unsupported file type. Allowed: ${allowed.join(", ")}`);
         return;
       }
+
+      const sid = sessionId ?? sessionStorage.getItem("rag_session_id");
+      if (!sid) {
+        setError("Start or open a session before uploading.");
+        return;
+      }
+
       setUploading(true);
-      setUploadMsg(null);
       setError(null);
       const fd = new FormData();
       fd.append("file", file);
+      fd.append("session_id", sid);
+
       try {
         const res = await fetch("/api/upload", { method: "POST", body: fd });
         const data = await res.json().catch(() => ({}));
@@ -267,27 +266,22 @@ export default function App() {
               : JSON.stringify(data.detail ?? res.statusText)
           );
         }
-        setUploadMsg(
-          `Indexed ${data.chunk_count ?? "?"} chunks from ${data.pdf_count ?? "?"} PDF(s).`
-        );
-        loadHealth();
+        setUploadedPdfs((prev) => [...prev, file.name]);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Upload failed");
       } finally {
         setUploading(false);
       }
     },
-    [loadHealth]
+    [sessionId]
   );
-
-  const chromaReady = health?.chroma_ready ?? false;
 
   return (
     <div className="min-h-screen font-sans text-slate-200 flex">
       <input
         ref={fileInputRef}
         type="file"
-        accept=".pdf,application/pdf"
+        accept=".pdf,.docx,.doc,.txt,.md,.png,.jpg,.jpeg,.webp"
         className="hidden"
         onChange={onFileChange}
       />
@@ -318,19 +312,11 @@ export default function App() {
           >
             + New chat
           </button>
-          <button
-            type="button"
-            onClick={onPickPdf}
-            disabled={uploading}
-            className="w-full text-sm py-2 rounded-lg border border-white/15 text-slate-200 hover:border-ember-500/40 hover:bg-ember-500/10 transition-colors disabled:opacity-50"
-          >
-            {uploading ? "Indexing…" : "Upload PDF"}
-          </button>
         </div>
         <nav className="flex-1 min-h-0 overflow-y-auto p-2 space-y-1">
           {sessions.length === 0 && (
             <p className="text-xs text-mist/80 px-2 py-4 text-center">
-              No saved chats yet. Start one or upload a PDF.
+              No saved chats yet. Start a new chat.
             </p>
           )}
           {sessions.map((s) => (
@@ -383,56 +369,30 @@ export default function App() {
                   Personal RAG Researcher
                 </h1>
                 <p className="text-mist text-sm mt-0.5 hidden sm:block">
-                  PDF library + web · Ollama + optional Cerebras
+                  Chat · Upload PDFs, Word docs, images · Web search
                 </p>
               </div>
             </div>
-            <div className="flex items-center gap-2 shrink-0">
-              {health && (
-                <span
-                  className={`text-xs px-2 py-1 rounded-full border ${
-                    chromaReady
-                      ? "border-emerald-500/40 text-emerald-400/90 bg-emerald-500/10"
-                      : "border-amber-500/40 text-amber-300/90 bg-amber-500/10"
-                  }`}
-                >
-                  {chromaReady ? "Index ready" : "Upload PDF"}
-                </span>
-              )}
-              <button
-                type="button"
-                onClick={() => void startNewSession()}
-                className="text-sm px-3 py-1.5 rounded-lg border border-white/10 text-mist hover:text-white hover:border-ember-500/50 hover:bg-ember-500/10 transition-colors hidden sm:inline-block"
-              >
-                New chat
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={() => void startNewSession()}
+              className="text-sm px-3 py-1.5 rounded-lg border border-white/10 text-mist hover:text-white hover:border-ember-500/50 hover:bg-ember-500/10 transition-colors hidden sm:inline-block"
+            >
+              New chat
+            </button>
           </div>
         </header>
 
         <main className="flex-1 max-w-3xl w-full mx-auto px-4 py-6 flex flex-col gap-4 min-h-0">
-          {!chromaReady && (
-            <div className="rounded-2xl border border-amber-500/25 bg-amber-950/30 px-4 py-3 text-amber-100/90 text-sm">
-              Add at least one PDF to build the search index. Use{" "}
-              <strong>Upload PDF</strong> in the sidebar (or{" "}
-              <code className="text-ember-400">python ingest.py</code>
-              ).
-            </div>
-          )}
-          {uploadMsg && (
-            <div className="rounded-xl border border-emerald-500/30 bg-emerald-950/30 px-4 py-2 text-emerald-100/90 text-sm">
-              {uploadMsg}
-            </div>
-          )}
 
           {messages.length === 0 && !loading && (
             <div className="rounded-2xl border border-white/5 bg-ink-800/40 p-8 text-center">
               <p className="font-display text-lg text-white/90 mb-2">
-                Ask about your documents
+                Ask a question or upload a document
               </p>
               <p className="text-mist text-sm max-w-md mx-auto leading-relaxed">
-                Chats are saved to <strong>History</strong>. Upload PDFs from the
-                sidebar to expand your library—they are indexed automatically.
+                Click <strong>📎</strong> to attach a <strong>PDF, Word doc, image, or text file</strong> to this session — it will only be visible here.
+                You can also ask general questions powered by web search.
               </p>
             </div>
           )}
@@ -481,7 +441,46 @@ export default function App() {
             </div>
           )}
 
+          {/* PDF chips — show uploaded PDFs for this session */}
+          {uploadedPdfs.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-1">
+              {uploadedPdfs.map((name) => {
+                const ext = name.split(".").pop()?.toLowerCase() ?? "";
+                const icon =
+                  ["png", "jpg", "jpeg", "webp"].includes(ext) ? "🖼️" :
+                  ["docx", "doc"].includes(ext) ? "📝" :
+                  ["txt", "md"].includes(ext) ? "📃" : "📄";
+                return (
+                  <span
+                    key={name}
+                    className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-200"
+                  >
+                    {icon} {name}
+                  </span>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Input bar with paperclip */}
           <div className="rounded-2xl border border-white/10 bg-ink-900/60 p-2 flex gap-2 items-end shadow-glow">
+            {/* Paperclip button */}
+            <button
+              type="button"
+              onClick={() => void onPickPdf()}
+              disabled={uploading}
+              title="Attach PDF, Word, image or text to this session"
+              className="shrink-0 mb-0.5 p-2.5 rounded-xl border border-white/10 text-mist hover:text-amber-200 hover:border-ember-500/40 hover:bg-ember-500/10 transition-colors disabled:opacity-40 disabled:pointer-events-none"
+            >
+              {uploading ? (
+                <span className="size-5 rounded-full border-2 border-ember-400 border-t-transparent animate-spin inline-block" />
+              ) : (
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="size-5">
+                  <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                </svg>
+              )}
+            </button>
+
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -491,19 +490,15 @@ export default function App() {
                   void send();
                 }
               }}
-              placeholder={
-                chromaReady
-                  ? "Ask a question…"
-                  : "Upload a PDF first to enable answers from your library…"
-              }
+              placeholder="Ask a question… (Shift+Enter for new line)"
               rows={2}
-              disabled={loading || !chromaReady}
+              disabled={loading}
               className="flex-1 resize-none bg-transparent border-0 rounded-xl px-3 py-2 text-slate-100 placeholder:text-mist/60 focus:outline-none focus:ring-0 text-[15px] min-h-[44px] max-h-40 disabled:opacity-50"
             />
             <button
               type="button"
               onClick={() => void send()}
-              disabled={loading || !input.trim() || !chromaReady}
+              disabled={loading || !input.trim()}
               className="shrink-0 mb-0.5 px-5 py-2.5 rounded-xl font-medium bg-gradient-to-br from-ember-500 to-ember-600 text-ink-950 hover:from-ember-400 hover:to-ember-500 disabled:opacity-40 disabled:pointer-events-none transition-all shadow-md"
             >
               Send

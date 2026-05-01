@@ -1,16 +1,19 @@
 """
-Load PDFs from the local `data` directory, chunk them, embed, and persist to Chroma.
-Replaces any existing `chroma_db` on each run (full rebuild).
+Load documents from PostgreSQL (scoped to a session), chunk, embed and push to PGVector.
+Supported types: PDF, Word (.docx / .doc), plain text (.txt / .md), images (.png / .jpg / .jpeg / .webp).
 """
 
 from __future__ import annotations
 
-import shutil
+import io
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_chroma import Chroma
+import psycopg2
+from langchain_postgres.vectorstores import PGVector
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -18,68 +21,217 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from embeddings_factory import get_embeddings
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-CHROMA_DIR = BASE_DIR / "chroma_db"
 
+# ---------------------------------------------------------------------------
+# Per-type loaders
+# ---------------------------------------------------------------------------
 
-def _load_pdf(path: Path) -> list[Document]:
-    """Prefer PyMuPDF (handles many academic PDFs better); fall back to PyPDFLoader."""
+def _load_pdf_bytes(file_bytes: bytes, filename: str) -> list[Document]:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+        f.write(file_bytes)
+        tmp_path = f.name
     try:
-        from langchain_community.document_loaders import PyMuPDFLoader
-    except ImportError:
-        return PyPDFLoader(str(path)).load()
+        try:
+            from langchain_community.document_loaders import PyMuPDFLoader
+            docs = PyMuPDFLoader(str(tmp_path)).load()
+        except (ImportError, Exception):
+            docs = PyPDFLoader(str(tmp_path)).load()
+        for d in docs:
+            d.metadata["source"] = filename
+        return docs
+    finally:
+        os.unlink(tmp_path)
+
+
+def _load_docx_bytes(file_bytes: bytes, filename: str) -> list[Document]:
+    """Extract text from .docx using python-docx."""
+    import docx  # python-docx
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as f:
+        f.write(file_bytes)
+        tmp_path = f.name
     try:
-        return PyMuPDFLoader(str(path)).load()
-    except Exception:
-        return PyPDFLoader(str(path)).load()
+        doc = docx.Document(tmp_path)
+        text = "\n".join(para.text for para in doc.paragraphs if para.text.strip())
+        if not text.strip():
+            raise ValueError("No text extracted from docx")
+        return [Document(page_content=text, metadata={"source": filename})]
+    finally:
+        os.unlink(tmp_path)
 
 
-def rebuild_vector_index() -> dict[str, int]:
+def _load_doc_bytes(file_bytes: bytes, filename: str) -> list[Document]:
+    """Extract text from legacy .doc via docx2txt (best-effort)."""
+    try:
+        import docx2txt
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as f:
+            f.write(file_bytes)
+            tmp_path = f.name
+        try:
+            text = docx2txt.process(tmp_path)
+            if not text or not text.strip():
+                raise ValueError("No text extracted from .doc")
+            return [Document(page_content=text, metadata={"source": filename})]
+        finally:
+            os.unlink(tmp_path)
+    except Exception as e:
+        raise ValueError(f"Could not load .doc file: {e}") from e
+
+
+def _load_text_bytes(file_bytes: bytes, filename: str) -> list[Document]:
+    """Load plain text / markdown files."""
+    text = file_bytes.decode("utf-8", errors="replace")
+    if not text.strip():
+        raise ValueError("Text file is empty")
+    return [Document(page_content=text, metadata={"source": filename})]
+
+
+def _load_image_bytes(file_bytes: bytes, filename: str) -> list[Document]:
+    """OCR an image and return its text as a Document."""
+    try:
+        import pytesseract
+        from PIL import Image
+        image = Image.open(io.BytesIO(file_bytes))
+        text = pytesseract.image_to_string(image)
+        if not text.strip():
+            raise ValueError("No text found in image via OCR")
+        return [Document(page_content=text, metadata={"source": filename})]
+    except ImportError as exc:
+        raise ValueError(
+            "pytesseract / Pillow not installed. Install them to use image OCR."
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+_LOADERS: dict[str, object] = {
+    ".pdf":  _load_pdf_bytes,
+    ".docx": _load_docx_bytes,
+    ".doc":  _load_doc_bytes,
+    ".txt":  _load_text_bytes,
+    ".md":   _load_text_bytes,
+    ".png":  _load_image_bytes,
+    ".jpg":  _load_image_bytes,
+    ".jpeg": _load_image_bytes,
+    ".webp": _load_image_bytes,
+}
+
+ALLOWED_EXTENSIONS: set[str] = set(_LOADERS.keys())
+
+
+def load_document_bytes(file_bytes: bytes, filename: str) -> list[Document]:
+    """Dispatch to the right loader based on file extension."""
+    ext = Path(filename).suffix.lower()
+    loader = _LOADERS.get(ext)
+    if loader is None:
+        raise ValueError(
+            f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+    return loader(file_bytes, filename)  # type: ignore[operator]
+
+
+# ---------------------------------------------------------------------------
+# Rebuild index
+# ---------------------------------------------------------------------------
+
+def rebuild_vector_index(session_id: str) -> dict[str, int]:
     """
-    Full rebuild of Chroma from all `data/*.pdf`.
-    Raises ValueError if no PDFs or no extractable text.
+    Embed all documents belonging to a session and push to PGVector with session metadata.
+    Raises ValueError if no documents or no extractable text.
     """
     load_dotenv(BASE_DIR / ".env")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    pdf_paths = sorted(DATA_DIR.glob("*.pdf"))
-    if not pdf_paths:
-        raise ValueError("No PDF files in the data folder. Add at least one .pdf file.")
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise ValueError("DATABASE_URL environment variable is not set")
 
     docs: list[Document] = []
-    for path in pdf_paths:
-        try:
-            docs.extend(_load_pdf(path))
-        except Exception as e:
-            print(f"Warning: could not load {path.name}: {e}", file=sys.stderr)
+    file_count = 0
+
+    with psycopg2.connect(db_url) as conn:
+        with conn.cursor() as cur:
+            # Ensure table exists
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS document_files (
+                    id SERIAL PRIMARY KEY,
+                    session_id TEXT,
+                    filename TEXT,
+                    content BYTEA,
+                    uploaded_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(session_id, filename)
+                )
+            """)
+            conn.commit()
+
+            cur.execute(
+                "SELECT filename, content FROM document_files WHERE session_id = %s",
+                (session_id,),
+            )
+            rows = cur.fetchall()
+
+            for row in rows:
+                filename, content = row[0], row[1]
+                if not content:
+                    continue
+                file_count += 1
+                try:
+                    loaded = load_document_bytes(bytes(content), filename)
+                    # Tag each chunk with session_id for metadata filtering
+                    for d in loaded:
+                        d.metadata["session_id"] = session_id
+                    docs.extend(loaded)
+                except Exception as e:
+                    print(f"Warning: could not load {filename}: {e}", file=sys.stderr)
+
+    if not file_count:
+        raise ValueError("No documents found for this session. Upload a file first.")
 
     if not docs:
-        raise ValueError("No text could be extracted from any PDF. Check that files are valid.")
+        raise ValueError("No text could be extracted from any document.")
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150)
     splits = splitter.split_documents(docs)
     embeddings = get_embeddings()
 
-    if CHROMA_DIR.exists():
-        shutil.rmtree(CHROMA_DIR)
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-
-    Chroma.from_documents(
-        documents=splits,
-        embedding=embeddings,
-        persist_directory=str(CHROMA_DIR),
+    vectorstore = PGVector(
+        embeddings=embeddings,
+        collection_name="rag_docs",
+        connection=db_url,
+        use_jsonb=True,
     )
-    return {"pdf_count": len(pdf_paths), "chunk_count": len(splits)}
+
+    # Delete old chunks for this session before re-indexing
+    try:
+        with psycopg2.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM langchain_pg_embedding
+                    WHERE collection_id IN (
+                        SELECT uuid FROM langchain_pg_collection WHERE name = 'rag_docs'
+                    )
+                    AND cmetadata->>'session_id' = %s
+                """, (session_id,))
+            conn.commit()
+    except Exception as e:
+        print(f"Note: could not clear old session embeddings: {e}")
+
+    vectorstore.add_documents(splits)
+
+    return {"pdf_count": file_count, "chunk_count": len(splits)}
 
 
 def main() -> None:
+    if len(sys.argv) < 2:
+        print("Usage: python ingest.py <session_id>", file=sys.stderr)
+        sys.exit(1)
+    session_id = sys.argv[1]
     try:
-        out = rebuild_vector_index()
+        out = rebuild_vector_index(session_id)
     except ValueError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
     print(
-        f"Ingested {out['chunk_count']} chunks from {out['pdf_count']} PDF(s) into {CHROMA_DIR}"
+        f"Ingested {out['chunk_count']} chunks from {out['pdf_count']} file(s) into PGVector (session={session_id})"
     )
 
 

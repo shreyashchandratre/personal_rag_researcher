@@ -1,14 +1,16 @@
-"""Persistent chat sessions (LangChain message JSON on disk)."""
+"""Persistent chat sessions (PostgreSQL)."""
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from langchain_core.messages import (
     BaseMessage,
     messages_from_dict,
@@ -17,54 +19,79 @@ from langchain_core.messages import (
 
 from agent_service import _message_text, last_assistant_text
 
-_BASE = Path(__file__).resolve().parent
-CHAT_DIR = _BASE / "chat_history"
+def get_db_connection():
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise ValueError("DATABASE_URL environment variable is not set")
+    return psycopg2.connect(db_url)
 
+def init_db():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_sessions (
+                        session_id UUID PRIMARY KEY,
+                        title TEXT,
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        messages JSONB DEFAULT '[]'::jsonb
+                    )
+                """)
+            conn.commit()
+    except Exception as e:
+        print(f"Failed to init chat DB: {e}")
+
+# Initialize DB tables on import
+init_db()
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
-def _session_path(session_id: str) -> Path:
-    if not re.match(r"^[a-f0-9-]{36}$", session_id):
-        raise ValueError("Invalid session id")
-    return CHAT_DIR / f"{session_id}.json"
-
-
 def load_messages(session_id: str) -> list[BaseMessage]:
+    if not re.match(r"^[a-f0-9-]{36}$", session_id):
+        return []
+        
     try:
-        path = _session_path(session_id)
-    except ValueError:
-        return []
-    if not path.is_file():
-        return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    raw = data.get("messages")
-    if raw is None:
-        return []
-    return messages_from_dict(raw)
-
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT messages FROM chat_sessions WHERE session_id = %s", (session_id,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return messages_from_dict(row[0])
+    except Exception as e:
+        print(f"Error loading messages: {e}")
+    return []
 
 def save_messages(session_id: str, messages: list[BaseMessage]) -> None:
-    CHAT_DIR.mkdir(parents=True, exist_ok=True)
-    path = _session_path(session_id)
-    payload = {
-        "version": 1,
-        "session_id": session_id,
-        "updated_at": _now_iso(),
-        "messages": messages_to_dict(messages),
-    }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
+    if not re.match(r"^[a-f0-9-]{36}$", session_id):
+        return
+        
+    msgs_dict = messages_to_dict(messages)
+    title = session_title(messages)
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO chat_sessions (session_id, title, updated_at, messages)
+                    VALUES (%s, %s, NOW(), %s)
+                    ON CONFLICT (session_id) 
+                    DO UPDATE SET title = EXCLUDED.title, updated_at = NOW(), messages = EXCLUDED.messages
+                """, (session_id, title, json.dumps(msgs_dict)))
+            conn.commit()
+    except Exception as e:
+        print(f"Error saving messages: {e}")
 
 def delete_session(session_id: str) -> None:
-    try:
-        path = _session_path(session_id)
-    except ValueError:
+    if not re.match(r"^[a-f0-9-]{36}$", session_id):
         return
-    if path.is_file():
-        path.unlink()
-
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM chat_sessions WHERE session_id = %s", (session_id,))
+            conn.commit()
+    except Exception as e:
+        print(f"Error deleting session: {e}")
 
 def session_title(messages: list[BaseMessage]) -> str:
     for m in messages:
@@ -73,7 +100,6 @@ def session_title(messages: list[BaseMessage]) -> str:
             if t:
                 return (t[:72] + "…") if len(t) > 72 else t
     return "New chat"
-
 
 def messages_for_ui(lc_messages: list[BaseMessage]) -> list[dict[str, str]]:
     """Pairs of user/assistant bubbles; skips tool/system noise for display."""
@@ -88,31 +114,26 @@ def messages_for_ui(lc_messages: list[BaseMessage]) -> list[dict[str, str]]:
                 out.append({"role": "assistant", "content": txt})
     return out
 
-
 def list_sessions_meta() -> list[dict[str, Any]]:
-    CHAT_DIR.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    for path in sorted(CHAT_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-        sid = path.stem
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-        msgs_raw = data.get("messages") or []
-        try:
-            msgs = messages_from_dict(msgs_raw)
-        except Exception:
-            continue
-        rows.append(
-            {
-                "session_id": sid,
-                "title": session_title(msgs),
-                "updated_at": data.get("updated_at") or _now_iso(),
-                "preview": session_title(msgs),
-            }
-        )
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT session_id, title, updated_at FROM chat_sessions ORDER BY updated_at DESC")
+                for row in cur.fetchall():
+                    sid = str(row['session_id'])
+                    title = row['title'] or "New chat"
+                    updated_at = row['updated_at'].isoformat() if row['updated_at'] else _now_iso()
+                    
+                    rows.append({
+                        "session_id": sid,
+                        "title": title,
+                        "updated_at": updated_at,
+                        "preview": title,
+                    })
+    except Exception as e:
+        print(f"Error listing sessions: {e}")
     return rows
-
 
 def new_session_id() -> str:
     return str(uuid.uuid4())

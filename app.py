@@ -10,9 +10,15 @@ import re
 import threading
 import uuid
 from pathlib import Path
-
+import psycopg2
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+
+BASE_DIR = Path(__file__).resolve().parent
+DIST_DIR = BASE_DIR / "frontend" / "dist"
+
+load_dotenv(BASE_DIR / ".env")
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,7 +27,6 @@ from pydantic import BaseModel, Field
 
 from agent_service import build_agent, last_assistant_text
 from chat_store import (
-    CHAT_DIR,
     delete_session,
     list_sessions_meta,
     load_messages,
@@ -33,11 +38,56 @@ from chat_store import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent
-DIST_DIR = BASE_DIR / "frontend" / "dist"
-DATA_DIR = BASE_DIR / "data"
+def get_db_connection():
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise ValueError("DATABASE_URL environment variable is not set")
+    return psycopg2.connect(db_url)
 
-load_dotenv(BASE_DIR / ".env")
+def init_doc_db():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Create table with session-scoped schema
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS document_files (
+                        id SERIAL PRIMARY KEY,
+                        session_id TEXT,
+                        filename TEXT,
+                        content BYTEA,
+                        uploaded_at TIMESTAMPTZ DEFAULT NOW(),
+                        UNIQUE(session_id, filename)
+                    )
+                """)
+                # Migration: add session_id if table existed without it
+                cur.execute("""
+                    ALTER TABLE document_files
+                    ADD COLUMN IF NOT EXISTS session_id TEXT
+                """)
+                # Migration: drop old unique constraint on filename alone if exists
+                cur.execute("""
+                    ALTER TABLE document_files
+                    DROP CONSTRAINT IF EXISTS document_files_filename_key
+                """)
+                # Migration: add new composite unique constraint if not exists
+                cur.execute("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conname = 'document_files_session_id_filename_key'
+                        ) THEN
+                            ALTER TABLE document_files
+                            ADD CONSTRAINT document_files_session_id_filename_key
+                            UNIQUE (session_id, filename);
+                        END IF;
+                    END $$;
+                """)
+            conn.commit()
+    except Exception as e:
+        print(f"Failed to init document DB: {e}")
+
+init_doc_db()
 
 app = FastAPI(title="Personal RAG Researcher", version="1.1.0")
 
@@ -49,25 +99,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_agent = None
-_agent_lock = threading.Lock()
 _ingest_lock = threading.Lock()
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "80")) * 1024 * 1024
 
 
-def invalidate_agent():
-    global _agent
-    with _agent_lock:
-        _agent = None
-
-
-def get_agent():
-    global _agent
-    with _agent_lock:
-        if _agent is None:
-            _agent = build_agent()
-        return _agent
+def get_agent(session_id: str | None = None):
+    """Build a fresh agent scoped to the session (no caching — fast enough)."""
+    return build_agent(session_id=session_id)
 
 
 _UUID_RE = re.compile(
@@ -96,10 +135,17 @@ class ChatResponse(BaseModel):
 
 @app.get("/api/health")
 def health():
-    chroma_ok = (BASE_DIR / "chroma_db").exists()
+    db_ok = True
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+    except Exception:
+        db_ok = False
+        
     return {
-        "status": "ok" if chroma_ok else "degraded",
-        "chroma_ready": chroma_ok,
+        "status": "ok" if db_ok else "degraded",
+        "chroma_ready": db_ok, # keep name for frontend compat
         "frontend_built": DIST_DIR.joinpath("index.html").is_file(),
     }
 
@@ -125,9 +171,10 @@ class SessionOut(BaseModel):
 def api_get_session(session_id: str):
     sid = _normalize_session_id(session_id)
     assert sid is not None
-    if not (CHAT_DIR / f"{sid}.json").is_file():
-        raise HTTPException(status_code=404, detail="Session not found")
     lc = load_messages(sid)
+    if not lc:
+        # Just return empty if not found
+        return SessionOut(session_id=sid, messages=[])
     return SessionOut(session_id=sid, messages=messages_for_ui(lc))
 
 
@@ -135,38 +182,28 @@ def api_get_session(session_id: str):
 def api_delete_session(session_id: str):
     sid = _normalize_session_id(session_id)
     assert sid is not None
-    if not (CHAT_DIR / f"{sid}.json").is_file():
-        raise HTTPException(status_code=404, detail="Session not found")
     delete_session(sid)
     return {"ok": True}
 
 
 @app.post("/api/session/reset")
 def reset_session(session_id: str = Query(..., description="Session to clear")):
-    """Remove persisted session (same as DELETE /api/sessions/{id})."""
+    """Remove persisted session."""
     sid = _normalize_session_id(session_id)
     assert sid is not None
-    if not (CHAT_DIR / f"{sid}.json").is_file():
-        raise HTTPException(status_code=404, detail="Session not found")
     delete_session(sid)
     return {"ok": True}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(body: ChatRequest):
-    if not (BASE_DIR / "chroma_db").exists():
-        raise HTTPException(
-            status_code=503,
-            detail="Vector store missing. Upload a PDF here or run python ingest.py.",
-        )
-
     sid = _normalize_session_id(body.session_id) if body.session_id else str(uuid.uuid4())
 
     messages = load_messages(sid)
     messages.append(HumanMessage(content=body.message.strip()))
 
     try:
-        agent = get_agent()
+        agent = get_agent(session_id=sid)
         result = agent.invoke({"messages": messages})
     except Exception as e:
         logger.exception("Agent invoke failed")
@@ -180,22 +217,42 @@ def chat(body: ChatRequest):
     return ChatResponse(reply=reply, session_id=sid)
 
 
+# Allowed upload extensions (must stay in sync with ingest.py ALLOWED_EXTENSIONS)
+_ALLOWED_UPLOAD_EXTS = {
+    ".pdf", ".docx", ".doc",
+    ".txt", ".md",
+    ".png", ".jpg", ".jpeg", ".webp",
+}
+
+
 @app.post("/api/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+async def upload_document(
+    file: UploadFile = File(...),
+    session_id: str | None = Form(None),
+):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided.")
 
     raw = file.filename.replace("\\", "/")
     name = Path(raw).name
     if name != file.filename and "/" in raw:
         raise HTTPException(status_code=400, detail="Invalid file name.")
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    dest = DATA_DIR / name
-    if dest.exists():
-        stem = dest.stem
-        suffix = dest.suffix
-        dest = DATA_DIR / f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+    ext = Path(name).suffix.lower()
+    if ext not in _ALLOWED_UPLOAD_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported file type '{ext}'. "
+                f"Allowed: {', '.join(sorted(_ALLOWED_UPLOAD_EXTS))}"
+            ),
+        )
+
+    # session_id is required for scoped uploads
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required for document upload.")
+    sid = _normalize_session_id(session_id)
+    assert sid is not None
 
     body = await file.read()
     if len(body) > MAX_UPLOAD_BYTES:
@@ -204,16 +261,25 @@ async def upload_pdf(file: UploadFile = File(...)):
             detail=f"File too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
         )
 
-    dest.write_bytes(body)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO document_files (session_id, filename, content)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (session_id, filename) DO UPDATE
+                        SET content = EXCLUDED.content, uploaded_at = NOW()
+                """, (sid, name, psycopg2.Binary(body)))
+            conn.commit()
+    except Exception as e:
+        logger.exception("Failed to save document to database")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
     try:
         with _ingest_lock:
             from ingest import rebuild_vector_index
-
-            stats = rebuild_vector_index()
-        invalidate_agent()
+            stats = rebuild_vector_index(session_id=sid)
     except ValueError as e:
-        dest.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         logger.exception("Ingest failed after upload")
@@ -221,8 +287,9 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     return {
         "ok": True,
-        "saved_as": dest.name,
-        "pdf_count": stats["pdf_count"],
+        "saved_as": name,
+        "session_id": sid,
+        "file_count": stats["pdf_count"],  # renamed internally but keep compat key
         "chunk_count": stats["chunk_count"],
     }
 
