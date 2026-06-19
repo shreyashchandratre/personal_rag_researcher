@@ -55,6 +55,7 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [docsOpen, setDocsOpen] = useState(true);
+  const [dbError, setDbError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const loadSessions = useCallback(async () => {
@@ -69,6 +70,18 @@ export default function App() {
   }, []);
 
   useEffect(() => { void loadSessions(); }, [loadSessions]);
+
+  // Check DB health on mount
+  useEffect(() => {
+    fetch("/api/health")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.status === "degraded") {
+          setDbError("Database unreachable. Your Supabase project may be paused — visit supabase.com/dashboard to resume it, then restart the server.");
+        }
+      })
+      .catch(() => setDbError("Cannot reach the API server. Make sure uvicorn is running."));
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -221,6 +234,21 @@ export default function App() {
 
       {/* ── Center: chat ── */}
       <div className="flex-1 flex flex-col min-h-screen min-w-0">
+
+        {/* DB error banner */}
+        {dbError && (
+          <div className="bg-red-950/80 border-b border-red-500/40 px-4 py-2.5 flex items-start gap-3 text-sm text-red-200">
+            <span className="shrink-0 mt-0.5">⚠️</span>
+            <span className="flex-1">{dbError}</span>
+            <button
+              className="shrink-0 text-red-400 hover:text-red-200 text-xs"
+              onClick={() => setDbError(null)}
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
         <header className="border-b border-white/5 bg-ink-900/80 backdrop-blur-md sticky top-0 z-10 shadow-glow">
           <div className="max-w-3xl mx-auto px-4 py-4 flex items-center justify-between gap-4">
             <div className="flex items-center gap-3 min-w-0">
@@ -347,7 +375,18 @@ export default function App() {
         </main>
       </div>
 
-      {/* ── Right sidebar: Chat history (slide-over on mobile) ── */}
+      {/* ── Right sidebar: Chat history — always visible on desktop ── */}
+      <aside className="hidden md:flex w-64 shrink-0 border-l border-white/5 bg-ink-950/90 flex-col max-h-screen sticky top-0">
+        <HistorySidebar
+          sessions={sessions}
+          sessionId={sessionId}
+          onSelect={(sid) => void selectSession(sid)}
+          onDelete={(sid, e) => void deleteSession(sid, e)}
+          onNew={() => void startNewSession()}
+        />
+      </aside>
+
+      {/* ── Mobile history slide-over ── */}
       {historyOpen && (
         <div className="fixed inset-0 z-40 flex md:hidden">
           <div className="absolute inset-0 bg-black/50" onClick={() => setHistoryOpen(false)} />
@@ -363,8 +402,6 @@ export default function App() {
           </aside>
         </div>
       )}
-
-      {/* History sidebar — desktop (hidden, available via separate panel if needed) */}
     </div>
   );
 }
