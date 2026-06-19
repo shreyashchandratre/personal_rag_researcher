@@ -1,6 +1,6 @@
 """
-Load documents from PostgreSQL (scoped to a session), chunk, embed and push to PGVector.
-Supported types: PDF, Word (.docx / .doc), plain text (.txt / .md), images (.png / .jpg / .jpeg / .webp).
+Document ingestion: load, chunk, embed, push to PGVector.
+Supported types: PDF, Word (.docx/.doc), plain text (.txt/.md), images (.png/.jpg/.jpeg/.webp).
 """
 
 from __future__ import annotations
@@ -44,14 +44,13 @@ def _load_pdf_bytes(file_bytes: bytes, filename: str) -> list[Document]:
 
 
 def _load_docx_bytes(file_bytes: bytes, filename: str) -> list[Document]:
-    """Extract text from .docx using python-docx."""
-    import docx  # python-docx
+    import docx
     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as f:
         f.write(file_bytes)
         tmp_path = f.name
     try:
         doc = docx.Document(tmp_path)
-        text = "\n".join(para.text for para in doc.paragraphs if para.text.strip())
+        text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
         if not text.strip():
             raise ValueError("No text extracted from docx")
         return [Document(page_content=text, metadata={"source": filename})]
@@ -60,7 +59,6 @@ def _load_docx_bytes(file_bytes: bytes, filename: str) -> list[Document]:
 
 
 def _load_doc_bytes(file_bytes: bytes, filename: str) -> list[Document]:
-    """Extract text from legacy .doc via docx2txt (best-effort)."""
     try:
         import docx2txt
         with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as f:
@@ -78,7 +76,6 @@ def _load_doc_bytes(file_bytes: bytes, filename: str) -> list[Document]:
 
 
 def _load_text_bytes(file_bytes: bytes, filename: str) -> list[Document]:
-    """Load plain text / markdown files."""
     text = file_bytes.decode("utf-8", errors="replace")
     if not text.strip():
         raise ValueError("Text file is empty")
@@ -86,7 +83,6 @@ def _load_text_bytes(file_bytes: bytes, filename: str) -> list[Document]:
 
 
 def _load_image_bytes(file_bytes: bytes, filename: str) -> list[Document]:
-    """OCR an image and return its text as a Document."""
     try:
         import pytesseract
         from PIL import Image
@@ -100,10 +96,6 @@ def _load_image_bytes(file_bytes: bytes, filename: str) -> list[Document]:
             "pytesseract / Pillow not installed. Install them to use image OCR."
         ) from exc
 
-
-# ---------------------------------------------------------------------------
-# Dispatch
-# ---------------------------------------------------------------------------
 
 _LOADERS: dict[str, object] = {
     ".pdf":  _load_pdf_bytes,
@@ -121,7 +113,6 @@ ALLOWED_EXTENSIONS: set[str] = set(_LOADERS.keys())
 
 
 def load_document_bytes(file_bytes: bytes, filename: str) -> list[Document]:
-    """Dispatch to the right loader based on file extension."""
     ext = Path(filename).suffix.lower()
     loader = _LOADERS.get(ext)
     if loader is None:
@@ -132,13 +123,55 @@ def load_document_bytes(file_bytes: bytes, filename: str) -> list[Document]:
 
 
 # ---------------------------------------------------------------------------
-# Rebuild index
+# Single-document ingest (used by upload endpoint)
+# ---------------------------------------------------------------------------
+
+def ingest_document_bytes(
+    file_bytes: bytes,
+    filename: str,
+    session_id: str,
+    doc_id: str,
+) -> int:
+    """
+    Chunk and embed a single document, tagging every chunk with session_id and doc_id.
+    Returns the number of chunks added.
+    Raises ValueError on bad input, Exception on infrastructure errors.
+    """
+    load_dotenv(BASE_DIR / ".env")
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise ValueError("DATABASE_URL environment variable is not set")
+
+    docs = load_document_bytes(file_bytes, filename)
+    for d in docs:
+        d.metadata["session_id"] = session_id
+        d.metadata["doc_id"] = doc_id
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150)
+    splits = splitter.split_documents(docs)
+
+    if not splits:
+        raise ValueError("No chunks produced — document may be empty.")
+
+    embeddings = get_embeddings()
+    vectorstore = PGVector(
+        embeddings=embeddings,
+        collection_name="rag_docs",
+        connection=db_url,
+        use_jsonb=True,
+    )
+    vectorstore.add_documents(splits)
+    return len(splits)
+
+
+# ---------------------------------------------------------------------------
+# Full session re-index (used by CLI / migrate)
 # ---------------------------------------------------------------------------
 
 def rebuild_vector_index(session_id: str) -> dict[str, int]:
     """
-    Embed all documents belonging to a session and push to PGVector with session metadata.
-    Raises ValueError if no documents or no extractable text.
+    Re-embed all documents for a session. Clears existing session vectors first.
+    Returns {"pdf_count": n, "chunk_count": m}.
     """
     load_dotenv(BASE_DIR / ".env")
     db_url = os.environ.get("DATABASE_URL")
@@ -150,42 +183,26 @@ def rebuild_vector_index(session_id: str) -> dict[str, int]:
 
     with psycopg2.connect(db_url) as conn:
         with conn.cursor() as cur:
-            # Ensure table exists
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS document_files (
-                    id SERIAL PRIMARY KEY,
-                    session_id TEXT,
-                    filename TEXT,
-                    content BYTEA,
-                    uploaded_at TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE(session_id, filename)
-                )
-            """)
-            conn.commit()
-
             cur.execute(
                 "SELECT filename, content FROM document_files WHERE session_id = %s",
                 (session_id,),
             )
             rows = cur.fetchall()
 
-            for row in rows:
-                filename, content = row[0], row[1]
-                if not content:
-                    continue
-                file_count += 1
-                try:
-                    loaded = load_document_bytes(bytes(content), filename)
-                    # Tag each chunk with session_id for metadata filtering
-                    for d in loaded:
-                        d.metadata["session_id"] = session_id
-                    docs.extend(loaded)
-                except Exception as e:
-                    print(f"Warning: could not load {filename}: {e}", file=sys.stderr)
+    for filename, content in rows:
+        if not content:
+            continue
+        file_count += 1
+        try:
+            loaded = load_document_bytes(bytes(content), filename)
+            for d in loaded:
+                d.metadata["session_id"] = session_id
+            docs.extend(loaded)
+        except Exception as e:
+            print(f"Warning: could not load {filename}: {e}", file=sys.stderr)
 
     if not file_count:
         raise ValueError("No documents found for this session. Upload a file first.")
-
     if not docs:
         raise ValueError("No text could be extracted from any document.")
 
@@ -200,23 +217,25 @@ def rebuild_vector_index(session_id: str) -> dict[str, int]:
         use_jsonb=True,
     )
 
-    # Delete old chunks for this session before re-indexing
+    # Clear old session vectors before re-indexing
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     DELETE FROM langchain_pg_embedding
                     WHERE collection_id IN (
                         SELECT uuid FROM langchain_pg_collection WHERE name = 'rag_docs'
                     )
                     AND cmetadata->>'session_id' = %s
-                """, (session_id,))
+                    """,
+                    (session_id,),
+                )
             conn.commit()
     except Exception as e:
         print(f"Note: could not clear old session embeddings: {e}")
 
     vectorstore.add_documents(splits)
-
     return {"pdf_count": file_count, "chunk_count": len(splits)}
 
 
@@ -231,7 +250,8 @@ def main() -> None:
         print(str(e), file=sys.stderr)
         sys.exit(1)
     print(
-        f"Ingested {out['chunk_count']} chunks from {out['pdf_count']} file(s) into PGVector (session={session_id})"
+        f"Ingested {out['chunk_count']} chunks from {out['pdf_count']} file(s) "
+        f"into PGVector (session={session_id})"
     )
 
 

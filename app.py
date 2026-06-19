@@ -1,5 +1,5 @@
 """
-FastAPI server: chat API, session history, PDF upload, static SPA.
+FastAPI server: chat API, session history, document upload/management, static SPA.
 """
 
 from __future__ import annotations
@@ -10,7 +10,9 @@ import re
 import threading
 import uuid
 from pathlib import Path
+
 import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,17 +40,18 @@ from chat_store import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 def get_db_connection():
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         raise ValueError("DATABASE_URL environment variable is not set")
     return psycopg2.connect(db_url)
 
+
 def init_doc_db():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                # Create table with session-scoped schema
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS document_files (
                         id SERIAL PRIMARY KEY,
@@ -59,37 +62,38 @@ def init_doc_db():
                         UNIQUE(session_id, filename)
                     )
                 """)
-                # Migration: add session_id if table existed without it
                 cur.execute("""
                     ALTER TABLE document_files
                     ADD COLUMN IF NOT EXISTS session_id TEXT
                 """)
-                # Migration: drop old unique constraint on filename alone if exists
                 cur.execute("""
                     ALTER TABLE document_files
                     DROP CONSTRAINT IF EXISTS document_files_filename_key
                 """)
-                # Migration: add new composite unique constraint if not exists
+                # Document registry — tracks each upload with status + chunk count
                 cur.execute("""
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM pg_constraint
-                            WHERE conname = 'document_files_session_id_filename_key'
-                        ) THEN
-                            ALTER TABLE document_files
-                            ADD CONSTRAINT document_files_session_id_filename_key
-                            UNIQUE (session_id, filename);
-                        END IF;
-                    END $$;
+                    CREATE TABLE IF NOT EXISTS document_registry (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        filename TEXT NOT NULL,
+                        file_size INTEGER NOT NULL DEFAULT 0,
+                        chunk_count INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'processing',
+                        uploaded_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_doc_registry_session
+                    ON document_registry (session_id)
                 """)
             conn.commit()
     except Exception as e:
         print(f"Failed to init document DB: {e}")
 
+
 init_doc_db()
 
-app = FastAPI(title="Personal RAG Researcher", version="1.1.0")
+app = FastAPI(title="Personal RAG Researcher", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,11 +107,11 @@ _ingest_lock = threading.Lock()
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "80")) * 1024 * 1024
 
-
-def get_agent(session_id: str | None = None):
-    """Build a fresh agent scoped to the session (no caching — fast enough)."""
-    return build_agent(session_id=session_id)
-
+_ALLOWED_UPLOAD_EXTS = {
+    ".pdf", ".docx", ".doc",
+    ".txt", ".md",
+    ".png", ".jpg", ".jpeg", ".webp",
+}
 
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
@@ -123,6 +127,14 @@ def _normalize_session_id(session_id: str | None) -> str | None:
     return sid.lower()
 
 
+def get_agent(session_id: str | None = None):
+    return build_agent(session_id=session_id)
+
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=16000)
     session_id: str | None = None
@@ -133,6 +145,20 @@ class ChatResponse(BaseModel):
     session_id: str
 
 
+class DocumentOut(BaseModel):
+    id: str
+    session_id: str
+    filename: str
+    file_size: int
+    chunk_count: int
+    status: str
+    uploaded_at: str
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
 @app.get("/api/health")
 def health():
     db_ok = True
@@ -142,13 +168,16 @@ def health():
                 cur.execute("SELECT 1")
     except Exception:
         db_ok = False
-        
     return {
         "status": "ok" if db_ok else "degraded",
-        "chroma_ready": db_ok, # keep name for frontend compat
+        "chroma_ready": db_ok,
         "frontend_built": DIST_DIR.joinpath("index.html").is_file(),
     }
 
+
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
 
 @app.get("/api/sessions")
 def api_list_sessions():
@@ -173,7 +202,6 @@ def api_get_session(session_id: str):
     assert sid is not None
     lc = load_messages(sid)
     if not lc:
-        # Just return empty if not found
         return SessionOut(session_id=sid, messages=[])
     return SessionOut(session_id=sid, messages=messages_for_ui(lc))
 
@@ -187,13 +215,16 @@ def api_delete_session(session_id: str):
 
 
 @app.post("/api/session/reset")
-def reset_session(session_id: str = Query(..., description="Session to clear")):
-    """Remove persisted session."""
+def reset_session(session_id: str = Query(...)):
     sid = _normalize_session_id(session_id)
     assert sid is not None
     delete_session(sid)
     return {"ok": True}
 
+
+# ---------------------------------------------------------------------------
+# Chat
+# ---------------------------------------------------------------------------
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(body: ChatRequest):
@@ -217,84 +248,244 @@ def chat(body: ChatRequest):
     return ChatResponse(reply=reply, session_id=sid)
 
 
-# Allowed upload extensions (must stay in sync with ingest.py ALLOWED_EXTENSIONS)
-_ALLOWED_UPLOAD_EXTS = {
-    ".pdf", ".docx", ".doc",
-    ".txt", ".md",
-    ".png", ".jpg", ".jpeg", ".webp",
-}
+# ---------------------------------------------------------------------------
+# Document registry endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/documents", response_model=list[DocumentOut])
+def list_documents(session_id: str = Query(...)):
+    sid = _normalize_session_id(session_id)
+    assert sid is not None
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, session_id, filename, file_size, chunk_count, status,
+                           uploaded_at
+                    FROM document_registry
+                    WHERE session_id = %s
+                    ORDER BY uploaded_at DESC
+                    """,
+                    (sid,),
+                )
+                rows = cur.fetchall()
+        return [
+            DocumentOut(
+                id=r["id"],
+                session_id=r["session_id"],
+                filename=r["filename"],
+                file_size=r["file_size"],
+                chunk_count=r["chunk_count"],
+                status=r["status"],
+                uploaded_at=r["uploaded_at"].isoformat(),
+            )
+            for r in rows
+        ]
+    except Exception as e:
+        logger.exception("Failed to list documents")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@app.post("/api/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    session_id: str | None = Form(None),
-):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided.")
+@app.get("/api/documents/{doc_id}/status")
+def get_document_status(doc_id: str, session_id: str = Query(...)):
+    sid = _normalize_session_id(session_id)
+    assert sid is not None
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, status, chunk_count FROM document_registry WHERE id = %s AND session_id = %s",
+                    (doc_id, sid),
+                )
+                row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Document not found")
+        return {"id": row["id"], "status": row["status"], "chunk_count": row["chunk_count"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
-    raw = file.filename.replace("\\", "/")
-    name = Path(raw).name
-    if name != file.filename and "/" in raw:
-        raise HTTPException(status_code=400, detail="Invalid file name.")
 
-    ext = Path(name).suffix.lower()
-    if ext not in _ALLOWED_UPLOAD_EXTS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unsupported file type '{ext}'. "
-                f"Allowed: {', '.join(sorted(_ALLOWED_UPLOAD_EXTS))}"
-            ),
-        )
-
-    # session_id is required for scoped uploads
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id is required for document upload.")
+@app.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: str, session_id: str = Query(...)):
+    """Remove a document's vectors from PGVector and its registry entry."""
     sid = _normalize_session_id(session_id)
     assert sid is not None
 
-    body = await file.read()
-    if len(body) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
-        )
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise HTTPException(status_code=500, detail="DATABASE_URL not set")
 
     try:
         with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, filename FROM document_registry WHERE id = %s AND session_id = %s",
+                    (doc_id, sid),
+                )
+                row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Document not found")
+
+        # Delete vectors tagged with this doc_id from PGVector
+        with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(
+                    """
+                    DELETE FROM langchain_pg_embedding
+                    WHERE collection_id IN (
+                        SELECT uuid FROM langchain_pg_collection WHERE name = 'rag_docs'
+                    )
+                    AND cmetadata->>'doc_id' = %s
+                    """,
+                    (doc_id,),
+                )
+                deleted_vectors = cur.rowcount
+
+            # Remove from document_files
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM document_files WHERE session_id = %s AND filename = %s",
+                    (sid, row["filename"]),
+                )
+            # Remove registry entry
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM document_registry WHERE id = %s",
+                    (doc_id,),
+                )
+            conn.commit()
+
+        logger.info("Deleted doc %s (%s vectors removed)", doc_id, deleted_vectors)
+        return {"ok": True, "vectors_removed": deleted_vectors}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to delete document %s", doc_id)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# ---------------------------------------------------------------------------
+# Upload (single or multi-file)
+# ---------------------------------------------------------------------------
+
+async def _ingest_one(
+    file: UploadFile,
+    sid: str,
+) -> dict:
+    """Process one file: save to DB, ingest to vector store, update registry."""
+    if not file.filename:
+        return {"filename": "", "ok": False, "error": "No filename"}
+
+    raw = file.filename.replace("\\", "/")
+    name = Path(raw).name
+    ext = Path(name).suffix.lower()
+
+    if ext not in _ALLOWED_UPLOAD_EXTS:
+        return {
+            "filename": name,
+            "ok": False,
+            "error": f"Unsupported type '{ext}'",
+        }
+
+    body = await file.read()
+    if len(body) > MAX_UPLOAD_BYTES:
+        max_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+        return {"filename": name, "ok": False, "error": f"File too large (max {max_mb} MB)"}
+
+    doc_id = str(uuid.uuid4())
+
+    # Write registry entry (status=processing)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO document_registry (id, session_id, filename, file_size, status)
+                    VALUES (%s, %s, %s, %s, 'processing')
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (doc_id, sid, name, len(body)),
+                )
+            conn.commit()
+    except Exception as e:
+        return {"filename": name, "ok": False, "error": f"Registry write failed: {e}"}
+
+    # Store raw file in document_files
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
                     INSERT INTO document_files (session_id, filename, content)
                     VALUES (%s, %s, %s)
                     ON CONFLICT (session_id, filename) DO UPDATE
                         SET content = EXCLUDED.content, uploaded_at = NOW()
-                """, (sid, name, psycopg2.Binary(body)))
+                    """,
+                    (sid, name, psycopg2.Binary(body)),
+                )
             conn.commit()
     except Exception as e:
-        logger.exception("Failed to save document to database")
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        _mark_registry(doc_id, "failed", 0)
+        return {"filename": name, "ok": False, "error": f"Storage failed: {e}"}
 
+    # Ingest into vector store (tagged with doc_id for future deletion)
     try:
         with _ingest_lock:
-            from ingest import rebuild_vector_index
-            stats = rebuild_vector_index(session_id=sid)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+            from ingest import ingest_document_bytes
+            chunk_count = ingest_document_bytes(
+                file_bytes=body,
+                filename=name,
+                session_id=sid,
+                doc_id=doc_id,
+            )
+        _mark_registry(doc_id, "ready", chunk_count)
+        return {"filename": name, "ok": True, "doc_id": doc_id, "chunk_count": chunk_count}
     except Exception as e:
-        logger.exception("Ingest failed after upload")
-        raise HTTPException(status_code=500, detail=f"Indexing failed: {e}") from e
-
-    return {
-        "ok": True,
-        "saved_as": name,
-        "session_id": sid,
-        "file_count": stats["pdf_count"],  # renamed internally but keep compat key
-        "chunk_count": stats["chunk_count"],
-    }
+        logger.exception("Ingest failed for %s", name)
+        _mark_registry(doc_id, "failed", 0)
+        return {"filename": name, "ok": False, "error": f"Indexing failed: {e}"}
 
 
-# --- Static frontend ---
+def _mark_registry(doc_id: str, status: str, chunk_count: int) -> None:
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE document_registry SET status = %s, chunk_count = %s WHERE id = %s",
+                    (status, chunk_count, doc_id),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.warning("Could not update registry for %s: %s", doc_id, e)
+
+
+@app.post("/api/upload")
+async def upload_documents(
+    files: list[UploadFile] = File(...),
+    session_id: str | None = Form(None),
+):
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required.")
+    sid = _normalize_session_id(session_id)
+    assert sid is not None
+
+    results = []
+    for f in files:
+        result = await _ingest_one(f, sid)
+        results.append(result)
+
+    any_ok = any(r["ok"] for r in results)
+    return {"ok": any_ok, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Static frontend
+# ---------------------------------------------------------------------------
+
 assets_dir = DIST_DIR / "assets"
 if assets_dir.is_dir():
     app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
@@ -306,9 +497,7 @@ async def spa_root():
     if not index.is_file():
         return JSONResponse(
             status_code=503,
-            content={
-                "detail": "Frontend not built. Run: cd frontend && npm install && npm run build",
-            },
+            content={"detail": "Frontend not built. Run: cd frontend && npm install && npm run build"},
         )
     return FileResponse(index)
 
@@ -323,7 +512,6 @@ async def favicon_svg():
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(
         "app:app",
         host=os.environ.get("HOST", "0.0.0.0"),

@@ -5,6 +5,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import DocumentPanel from "./DocumentPanel";
+import NeuralAnimation from "./NeuralAnimation";
 
 type Role = "user" | "assistant";
 
@@ -51,11 +53,9 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionRow[]>([]);
-  const [historyOpen, setHistoryOpen] = useState(true);
-  const [uploading, setUploading] = useState(false);
-  const [uploadedPdfs, setUploadedPdfs] = useState<string[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [docsOpen, setDocsOpen] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadSessions = useCallback(async () => {
     try {
@@ -68,9 +68,7 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    void loadSessions();
-  }, [loadSessions]);
+  useEffect(() => { void loadSessions(); }, [loadSessions]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -85,7 +83,6 @@ export default function App() {
       const sid = data.session_id as string;
       setSessionId(sid);
       setMessages([]);
-      setUploadedPdfs([]);
       sessionStorage.setItem("rag_session_id", sid);
       await loadSessions();
       return sid;
@@ -119,31 +116,28 @@ export default function App() {
       });
   }, []);
 
-  const selectSession = useCallback(
-    async (sid: string) => {
-      setError(null);
-      setUploadedPdfs([]);
-      try {
-        const r = await fetch(`/api/sessions/${sid}`);
-        if (!r.ok) throw new Error("Session not found");
-        const data = await r.json();
-        setSessionId(data.session_id);
-        sessionStorage.setItem("rag_session_id", data.session_id);
-        setMessages(
-          data.messages.map(
-            (m: { role: string; content: string }, i: number) => ({
-              id: `${sid}-${i}`,
-              role: m.role as Role,
-              content: m.content,
-            })
-          )
-        );
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Could not load chat");
-      }
-    },
-    []
-  );
+  const selectSession = useCallback(async (sid: string) => {
+    setError(null);
+    try {
+      const r = await fetch(`/api/sessions/${sid}`);
+      if (!r.ok) throw new Error("Session not found");
+      const data = await r.json();
+      setSessionId(data.session_id);
+      sessionStorage.setItem("rag_session_id", data.session_id);
+      setMessages(
+        data.messages.map(
+          (m: { role: string; content: string }, i: number) => ({
+            id: `${sid}-${i}`,
+            role: m.role as Role,
+            content: m.content,
+          })
+        )
+      );
+      setHistoryOpen(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load chat");
+    }
+  }, []);
 
   const deleteSession = useCallback(
     async (sid: string, e: React.MouseEvent) => {
@@ -156,7 +150,6 @@ export default function App() {
           sessionStorage.removeItem("rag_session_id");
           setSessionId(null);
           setMessages([]);
-          setUploadedPdfs([]);
         }
         await loadSessions();
       } catch (err) {
@@ -178,11 +171,7 @@ export default function App() {
     setInput("");
     setError(null);
 
-    const userMsg: Msg = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content: text,
-    };
+    const userMsg: Msg = { id: crypto.randomUUID(), role: "user", content: text };
     setMessages((m) => [...m, userMsg]);
     setLoading(true);
 
@@ -190,10 +179,7 @@ export default function App() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: text,
-          session_id: sid,
-        }),
+        body: JSON.stringify({ message: text, session_id: sid }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -207,11 +193,7 @@ export default function App() {
       sessionStorage.setItem("rag_session_id", data.session_id);
       setMessages((m) => [
         ...m,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: data.reply ?? "",
-        },
+        { id: crypto.randomUUID(), role: "assistant", content: data.reply ?? "" },
       ]);
       await loadSessions();
     } catch (e) {
@@ -222,154 +204,48 @@ export default function App() {
     }
   }, [input, loading, sessionId, loadSessions, startNewSession]);
 
-  // PDF upload — session-scoped
-  const onPickPdf = useCallback(async () => {
-    // Ensure we have a session first
-    let sid = sessionId ?? sessionStorage.getItem("rag_session_id");
-    if (!sid) {
-      sid = await startNewSession();
-    }
-    if (sid) fileInputRef.current?.click();
-  }, [sessionId, startNewSession]);
-
-  const onFileChange = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      e.target.value = "";
-      if (!file) return;
-      const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
-      const allowed = ["pdf", "docx", "doc", "txt", "md", "png", "jpg", "jpeg", "webp"];
-      if (!allowed.includes(ext)) {
-        setError(`Unsupported file type. Allowed: ${allowed.join(", ")}`);
-        return;
-      }
-
-      const sid = sessionId ?? sessionStorage.getItem("rag_session_id");
-      if (!sid) {
-        setError("Start or open a session before uploading.");
-        return;
-      }
-
-      setUploading(true);
-      setError(null);
-      const fd = new FormData();
-      fd.append("file", file);
-      fd.append("session_id", sid);
-
-      try {
-        const res = await fetch("/api/upload", { method: "POST", body: fd });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          throw new Error(
-            typeof data.detail === "string"
-              ? data.detail
-              : JSON.stringify(data.detail ?? res.statusText)
-          );
-        }
-        setUploadedPdfs((prev) => [...prev, file.name]);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Upload failed");
-      } finally {
-        setUploading(false);
-      }
-    },
-    [sessionId]
-  );
-
   return (
     <div className="min-h-screen font-sans text-slate-200 flex">
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".pdf,.docx,.doc,.txt,.md,.png,.jpg,.jpeg,.webp"
-        className="hidden"
-        onChange={onFileChange}
-      />
 
-      {/* Sidebar — history */}
+      {/* ── Left sidebar: Document panel ── */}
       <aside
         className={`${
-          historyOpen ? "flex" : "hidden"
-        } md:flex w-full md:w-72 shrink-0 border-r border-white/5 bg-ink-950/90 flex-col max-h-screen sticky top-0`}
+          docsOpen ? "flex" : "hidden"
+        } md:flex w-full md:w-64 shrink-0 border-r border-white/5 bg-ink-950/90 flex-col max-h-screen sticky top-0`}
       >
-        <div className="p-3 border-b border-white/5 space-y-2">
-          <div className="flex items-center justify-between gap-2">
-            <h2 className="font-display text-sm font-semibold text-white/90">
-              History
-            </h2>
-            <button
-              type="button"
-              className="md:hidden text-xs text-mist"
-              onClick={() => setHistoryOpen(false)}
-            >
-              Close
-            </button>
-          </div>
-          <button
-            type="button"
-            onClick={() => void startNewSession()}
-            className="w-full text-sm py-2 rounded-lg bg-ember-500/20 border border-ember-500/30 text-amber-100 hover:bg-ember-500/30 transition-colors"
-          >
-            + New chat
-          </button>
-        </div>
-        <nav className="flex-1 min-h-0 overflow-y-auto p-2 space-y-1">
-          {sessions.length === 0 && (
-            <p className="text-xs text-mist/80 px-2 py-4 text-center">
-              No saved chats yet. Start a new chat.
-            </p>
-          )}
-          {sessions.map((s) => (
-            <div
-              key={s.session_id}
-              className={`relative group rounded-xl border transition-colors ${
-                sessionId === s.session_id
-                  ? "border-ember-500/40 bg-ember-500/10"
-                  : "border-transparent hover:border-white/10 hover:bg-white/5"
-              }`}
-            >
-              <button
-                type="button"
-                onClick={() => void selectSession(s.session_id)}
-                className="w-full text-left px-3 py-2.5 pr-8"
-              >
-                <span className="block text-sm text-white/90 line-clamp-2">
-                  {s.title || "Chat"}
-                </span>
-                <span className="text-[11px] text-mist/70 mt-0.5">
-                  {new Date(s.updated_at).toLocaleString()}
-                </span>
-              </button>
-              <button
-                type="button"
-                title="Delete"
-                onClick={(e) => void deleteSession(s.session_id, e)}
-                className="absolute right-2 top-2 z-10 opacity-0 group-hover:opacity-100 text-mist hover:text-red-400 text-xs p-1"
-              >
-                ✕
-              </button>
-            </div>
-          ))}
-        </nav>
+        <DocumentPanel
+          sessionId={sessionId}
+          onSessionNeeded={startNewSession}
+        />
       </aside>
 
+      {/* ── Center: chat ── */}
       <div className="flex-1 flex flex-col min-h-screen min-w-0">
         <header className="border-b border-white/5 bg-ink-900/80 backdrop-blur-md sticky top-0 z-10 shadow-glow">
           <div className="max-w-3xl mx-auto px-4 py-4 flex items-center justify-between gap-4">
             <div className="flex items-center gap-3 min-w-0">
+              {/* Mobile: toggle docs panel */}
+              <button
+                type="button"
+                className="md:hidden shrink-0 px-2 py-1 rounded border border-white/15 text-sm text-mist"
+                onClick={() => setDocsOpen((v) => !v)}
+              >
+                📚
+              </button>
+              {/* Mobile: toggle history */}
               <button
                 type="button"
                 className="md:hidden shrink-0 px-2 py-1 rounded border border-white/15 text-sm text-mist"
                 onClick={() => setHistoryOpen(true)}
               >
-                Menu
+                ☰
               </button>
               <div className="min-w-0">
                 <h1 className="font-display text-xl font-semibold tracking-tight text-white truncate">
                   Personal RAG Researcher
                 </h1>
                 <p className="text-mist text-sm mt-0.5 hidden sm:block">
-                  Chat · Upload PDFs, Word docs, images · Web search
+                  Chat · Upload study materials · Web search
                 </p>
               </div>
             </div>
@@ -385,15 +261,19 @@ export default function App() {
 
         <main className="flex-1 max-w-3xl w-full mx-auto px-4 py-6 flex flex-col gap-4 min-h-0">
 
+          {/* Empty state with neural animation */}
           {messages.length === 0 && !loading && (
-            <div className="rounded-2xl border border-white/5 bg-ink-800/40 p-8 text-center">
-              <p className="font-display text-lg text-white/90 mb-2">
-                Ask a question or upload a document
-              </p>
-              <p className="text-mist text-sm max-w-md mx-auto leading-relaxed">
-                Click <strong>📎</strong> to attach a <strong>PDF, Word doc, image, or text file</strong> to this session — it will only be visible here.
-                You can also ask general questions powered by web search.
-              </p>
+            <div className="rounded-2xl border border-white/5 bg-ink-800/40 p-8 flex flex-col items-center gap-4">
+              <NeuralAnimation />
+              <div className="text-center">
+                <p className="font-display text-lg text-white/90 mb-2">
+                  Ask a question or upload study materials
+                </p>
+                <p className="text-mist text-sm max-w-md mx-auto leading-relaxed">
+                  Upload PDFs, Word docs, images, or text files using the panel on the left. 
+                  You can also ask general questions powered by web search.
+                </p>
+              </div>
             </div>
           )}
 
@@ -413,9 +293,7 @@ export default function App() {
                   <span className="text-xs uppercase tracking-wider opacity-50 block mb-1.5">
                     {m.role === "user" ? "You" : "Assistant"}
                   </span>
-                  <div className="whitespace-pre-wrap">
-                    {formatInline(m.content)}
-                  </div>
+                  <div className="whitespace-pre-wrap">{formatInline(m.content)}</div>
                 </div>
               </div>
             ))}
@@ -441,46 +319,8 @@ export default function App() {
             </div>
           )}
 
-          {/* PDF chips — show uploaded PDFs for this session */}
-          {uploadedPdfs.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 px-1">
-              {uploadedPdfs.map((name) => {
-                const ext = name.split(".").pop()?.toLowerCase() ?? "";
-                const icon =
-                  ["png", "jpg", "jpeg", "webp"].includes(ext) ? "🖼️" :
-                  ["docx", "doc"].includes(ext) ? "📝" :
-                  ["txt", "md"].includes(ext) ? "📃" : "📄";
-                return (
-                  <span
-                    key={name}
-                    className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-200"
-                  >
-                    {icon} {name}
-                  </span>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Input bar with paperclip */}
+          {/* Input bar */}
           <div className="rounded-2xl border border-white/10 bg-ink-900/60 p-2 flex gap-2 items-end shadow-glow">
-            {/* Paperclip button */}
-            <button
-              type="button"
-              onClick={() => void onPickPdf()}
-              disabled={uploading}
-              title="Attach PDF, Word, image or text to this session"
-              className="shrink-0 mb-0.5 p-2.5 rounded-xl border border-white/10 text-mist hover:text-amber-200 hover:border-ember-500/40 hover:bg-ember-500/10 transition-colors disabled:opacity-40 disabled:pointer-events-none"
-            >
-              {uploading ? (
-                <span className="size-5 rounded-full border-2 border-ember-400 border-t-transparent animate-spin inline-block" />
-              ) : (
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="size-5">
-                  <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
-                </svg>
-              )}
-            </button>
-
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -506,6 +346,102 @@ export default function App() {
           </div>
         </main>
       </div>
+
+      {/* ── Right sidebar: Chat history (slide-over on mobile) ── */}
+      {historyOpen && (
+        <div className="fixed inset-0 z-40 flex md:hidden">
+          <div className="absolute inset-0 bg-black/50" onClick={() => setHistoryOpen(false)} />
+          <aside className="relative ml-auto w-72 bg-ink-950 h-full flex flex-col border-l border-white/5">
+            <HistorySidebar
+              sessions={sessions}
+              sessionId={sessionId}
+              onSelect={(sid) => void selectSession(sid)}
+              onDelete={(sid, e) => void deleteSession(sid, e)}
+              onNew={() => void startNewSession()}
+              onClose={() => setHistoryOpen(false)}
+            />
+          </aside>
+        </div>
+      )}
+
+      {/* History sidebar — desktop (hidden, available via separate panel if needed) */}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// History sidebar sub-component
+// ---------------------------------------------------------------------------
+
+interface HistorySidebarProps {
+  sessions: SessionRow[];
+  sessionId: string | null;
+  onSelect: (sid: string) => void;
+  onDelete: (sid: string, e: React.MouseEvent) => void;
+  onNew: () => void;
+  onClose?: () => void;
+}
+
+function HistorySidebar({
+  sessions, sessionId, onSelect, onDelete, onNew, onClose,
+}: HistorySidebarProps) {
+  return (
+    <>
+      <div className="p-3 border-b border-white/5 space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="font-display text-sm font-semibold text-white/90">History</h2>
+          {onClose && (
+            <button type="button" className="text-xs text-mist" onClick={onClose}>
+              Close
+            </button>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onNew}
+          className="w-full text-sm py-2 rounded-lg bg-ember-500/20 border border-ember-500/30 text-amber-100 hover:bg-ember-500/30 transition-colors"
+        >
+          + New chat
+        </button>
+      </div>
+      <nav className="flex-1 min-h-0 overflow-y-auto p-2 space-y-1">
+        {sessions.length === 0 && (
+          <p className="text-xs text-mist/80 px-2 py-4 text-center">
+            No saved chats yet.
+          </p>
+        )}
+        {sessions.map((s) => (
+          <div
+            key={s.session_id}
+            className={`relative group rounded-xl border transition-colors ${
+              sessionId === s.session_id
+                ? "border-ember-500/40 bg-ember-500/10"
+                : "border-transparent hover:border-white/10 hover:bg-white/5"
+            }`}
+          >
+            <button
+              type="button"
+              onClick={() => onSelect(s.session_id)}
+              className="w-full text-left px-3 py-2.5 pr-8"
+            >
+              <span className="block text-sm text-white/90 line-clamp-2">
+                {s.title || "Chat"}
+              </span>
+              <span className="text-[11px] text-mist/70 mt-0.5">
+                {new Date(s.updated_at).toLocaleString()}
+              </span>
+            </button>
+            <button
+              type="button"
+              title="Delete"
+              onClick={(e) => onDelete(s.session_id, e)}
+              className="absolute right-2 top-2 z-10 opacity-0 group-hover:opacity-100 text-mist hover:text-red-400 text-xs p-1"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+      </nav>
+    </>
   );
 }
